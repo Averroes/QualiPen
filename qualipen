@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+# Dépend de PyYAML
+try:
+    import yaml
+except ImportError:
+    print("❌ Le module 'pyyaml' est requis. Installe-le : pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+DEFAULT_CONFIG_PATH = Path.home() / ".qualipen" / "config.yml"
+
+def x11_auth_mount() -> list:
+    xauth = os.environ.get("XAUTHORITY") or str(Path.home() / ".Xauthority")
+    return ["-e", "XAUTHORITY=/root/.Xauthority", "-v", f"{xauth}:/root/.Xauthority:ro"] if os.path.exists(xauth) else []
+
+def detect_xauthority() -> str | None:
+    """
+    Trouve le bon fichier Xauthority :
+    1) $XAUTHORITY s'il pointe vers un fichier existant
+    2) /run/user/$UID/.mutter-Xwaylandauth.* (le plus récent) — Wayland/GNOME
+    3) ~/.Xauthority (fallback X11)
+    """
+    cand = os.environ.get("XAUTHORITY")
+    if cand and os.path.exists(cand):
+        return cand
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if os.path.isdir(runtime):
+        try:
+            mutters = [
+                os.path.join(runtime, f)
+                for f in os.listdir(runtime)
+                if f.startswith(".mutter-Xwaylandauth")
+            ]
+            mutters.sort(key=os.path.getmtime, reverse=True)
+            if mutters:
+                return mutters[0]
+        except Exception:
+            pass
+
+    home_xauth = str(Path.home() / ".Xauthority")
+    return home_xauth if os.path.exists(home_xauth) else None
+
+def x11_mounts_full(cfg: dict) -> list:
+    """
+    Prépare tout pour X11/XWayland :
+    - DISPLAY du host
+    - Montage du socket X11
+    - Passage du cookie XAUTHORITY (si trouvé)
+    - Désactive MIT-SHM pour éviter des soucis de shm en conteneur
+    """
+    parts = []
+    disp = os.environ.get("DISPLAY")
+    if disp:
+        parts += ["-e", f"DISPLAY={disp}"]
+    parts += ["-v", "/tmp/.X11-unix:/tmp/.X11-unix"]
+    xauth = detect_xauthority()
+    if xauth:
+        parts += ["-e", "XAUTHORITY=/root/.Xauthority", "-v", f"{xauth}:/root/.Xauthority:ro"]
+    parts += ["-e", "QT_X11_NO_MITSHM=1"]
+    return parts
+
+def user_flag_if_needed() -> list:
+    """
+    Optionnel : exécuter le conteneur avec ton UID:GID.
+    Utile si tu ne veux PAS faire `xhost +SI:localuser:root`.
+    """
+    try:
+        return ["--user", f"{os.getuid()}:{os.getgid()}"]
+    except Exception:
+        return []
+    
+def expand(path: str) -> str:
+    if path is None:
+        return None
+    return os.path.expanduser(os.path.expandvars(path))
+
+def load_config(cfg_path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    if not cfg_path.exists():
+        print(f"⚠️  Config non trouvée: {cfg_path}. Lance 'qualipen init' pour initialiser.", file=sys.stderr)
+        return {}
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    # expand all string values recursively
+    def _expand(obj):
+        if isinstance(obj, dict):
+            return {k: _expand(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_expand(v) for v in obj]
+        if isinstance(obj, str):
+            return expand(obj)
+        return obj
+    return _expand(cfg)
+
+def ensure_dir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def run(cmd: list, check: bool = True) -> int:
+    # Affiche la commande pour debug léger
+    print("➜", " ".join(str(c) for c in cmd))
+    proc = subprocess.run(cmd)
+    if check and proc.returncode != 0:
+        sys.exit(proc.returncode)
+    return proc.returncode
+
+def docker_exists() -> bool:
+    try:
+        subprocess.run(["docker", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
+
+def container_exists(name: str) -> bool:
+    res = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True)
+    names = res.stdout.splitlines()
+    return name in names
+
+def get_env_display(cfg: dict) -> list:
+    env = []
+    if cfg.get("docker", {}).get("use_display", True):
+        disp = os.environ.get("DISPLAY")
+        if not disp:
+            print("⚠️  $DISPLAY n'est pas défini. Les apps graphiques (Burp/ZAP) risquent de ne pas s'afficher.", file=sys.stderr)
+        else:
+            env += ["-e", f"DISPLAY={disp}"]
+    return env
+
+def x11_mounts(cfg: dict) -> list:
+    socket = cfg.get("docker", {}).get("x11_socket", "/tmp/.X11-unix")
+    return ["-v", f"{socket}:{socket}"]
+
+def common_mounts(cfg: dict, name: str, ensure_dirs: bool = False) -> list:
+    paths = cfg.get("paths", {})
+    mounts = cfg.get("mounts", {})
+    volume_root = paths.get("volume_root")
+    base_config = paths.get("base_config")
+    my_config = paths.get("my_config")
+    common = paths.get("common")
+
+    if ensure_dirs:
+        for p in [volume_root, base_config, my_config, common]:
+            if p:
+                ensure_dir(p)
+        if volume_root and name:
+            ensure_dir(os.path.join(volume_root, name))
+
+    data_mount = ["-v", f"{os.path.join(volume_root, name)}:{mounts.get('data', '/root/data')}"] if volume_root and name else []
+    base_cfg_mount = ["-v", f"{base_config}:{mounts.get('base_config', '/opt/base_config')}"] if base_config else []
+    my_cfg_mount = ["-v", f"{my_config}:{mounts.get('my_config', '/opt/my_config')}"] if my_config else []
+    common_mount = ["-v", f"{common}:{mounts.get('common', '/opt/common')}"] if common else []
+
+    return data_mount + base_cfg_mount + my_cfg_mount + common_mount
+
+def burp_executable_present(cfg: dict, burp_vol: str) -> bool:
+    """Vérifie /root/burp/BurpSuitePro (exécutable) dans le volume."""
+    image = cfg.get("docker", {}).get("image", "tools-team")
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{burp_vol}:/root/burp",
+        image, "bash", "-lc",
+        "test -x /root/burp/BurpSuitePro"
+    ]
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+def seed_burp_volume(cfg: dict, burp_vol: str, src_dir: str) -> None:
+    """
+    Copie TOUT le contenu de src_dir vers /root/burp dans le volume, y compris .install4j.
+    Préserve les droits. Essaie rsync -a, sinon fallback cp -a avec le '.' terminal.
+    """
+    if not src_dir or not os.path.isdir(src_dir):
+        print(f"❌ Dossier source introuvable pour Burp: {src_dir}", file=sys.stderr)
+        sys.exit(2)
+
+    image = cfg.get("docker", {}).get("image", "tools-team")
+    src_dir = os.path.abspath(src_dir)
+
+    run([
+        "docker", "run", "--rm",
+        "-v", f"{burp_vol}:/root/burp",
+        "-v", f"{src_dir}:/seed:ro",
+        image, "bash", "-lc",
+        # copy all (dotfiles included) + preserve perms; ensure executable bit
+        "set -e; "
+        "mkdir -p /root/burp; "
+        "if command -v rsync >/dev/null 2>&1; then "
+        "  rsync -a /seed/ /root/burp/; "
+        "else "
+        "  cp -a /seed/. /root/burp/; "
+        "fi; "
+        "chmod +x /root/burp/BurpSuitePro 2>/dev/null || true; "
+        "ls -la /root/burp | head -n 25"
+    ])
+
+
+def cmd_burp_init(args):
+    """
+    Crée (ou garde) le volume burp-data et, si --from est fourni, copie l'installation complète dedans.
+    """
+    cfg = load_config()
+    burp_vol = cfg.get("burp", {}).get("volume", "burp-data")
+
+    subprocess.run(["docker", "volume", "create", "--name", burp_vol], stdout=subprocess.DEVNULL)
+    print(f"📦 Volume Docker prêt : {burp_vol}")
+
+    if args.src:
+        print(f"📥 Copie de l'installation Burp depuis : {args.src}")
+        seed_burp_volume(cfg, burp_vol, args.src)
+
+    if burp_executable_present(cfg, burp_vol):
+        print("✅ BurpSuitePro détecté dans le volume.")
+    else:
+        print("⚠️  Burp n'est pas encore installé dans le volume.")
+        print("    Utilise :  qualipen burp-init --from /chemin/vers/ton/dossier/BurpSuitePro")
+
+
+
+def cmd_init(args):
+    base = Path.home() / ".qualipen"
+    cfg_path = base / "config.yml"
+    ensure_dir(str(base))
+    # Dossiers par défaut
+    defaults = {
+        "paths": {
+            "tools_root": "${HOME}/QualiPen",
+            "volume_root": "${HOME}/.qualipen/data",
+            "base_config": "${HOME}/.qualipen/base_config",
+            "my_config": "${HOME}/.qualipen/my_config",
+            "common": "${HOME}/.qualipen/common",
+        },
+        "docker": {
+            "image": "tools-team",
+            "shell_container_prefix": "pen-shell-",
+            "x11_socket": "/tmp/.X11-unix",
+            "use_display": True,
+            "build_context": ".",
+        },
+        "mounts": {
+            "data": "/root/data",
+            "base_config": "/opt/base_config",
+            "my_config": "/opt/my_config",
+            "common": "/opt/common",
+        },
+        "burp": {"volume": "burp-data", "executable": "/root/burp/BurpSuitePro"},
+        "zap": {"volume": "zap-data", "executable": "zaproxy"},
+    }
+    # Ecrit le YAML si absent
+    if not cfg_path.exists():
+        with cfg_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(defaults, f, sort_keys=False, allow_unicode=True)
+        print(f"✅ Config créée : {cfg_path}")
+    else:
+        print(f"ℹ️  Config déjà présente : {cfg_path}")
+    # Crée les dossiers
+    cfg = load_config(cfg_path)
+    for p in [cfg.get("paths", {}).get(k) for k in ("volume_root", "base_config", "my_config", "common")]:
+        if p:
+            ensure_dir(p)
+            print(f"📁 {p}")
+    print("Fini.")
+
+def cmd_build(args):
+    cfg = load_config()
+    image = args.tag or cfg.get("docker", {}).get("image", "tools-team")
+    context = args.context or cfg.get("docker", {}).get("build_context", ".")
+    cmd = ["docker", "build", "-t", image, context]
+    if args.no_cache:
+        cmd.insert(2, "--no-cache")
+    if args.pull:
+        cmd.insert(2, "--pull")
+    # build-arg
+    for ba in (args.build_arg or []):
+        cmd[2:2] = ["--build-arg", ba]
+    print('🧱 Building the Docker image "{}"...'.format(image))
+    run(cmd)
+
+def cmd_shell(args):
+    cfg = load_config()
+    if not args.name:
+        print("❌ Vous devez indiquer un nom (ex: qualipen shell monprojet)", file=sys.stderr)
+        sys.exit(2)
+    name = f"{cfg.get('docker', {}).get('shell_container_prefix', 'pen-shell-')}{args.name}"
+    image = cfg.get("docker", {}).get("image", "tools-team")
+
+    if container_exists(name):
+        print(f"🔁 Le conteneur '{name}' existe déjà. Attaching...")
+        run(["docker", "start", "-ai", name])
+        return
+
+    print(f"🚀 Création et démarrage d'un nouveau conteneur '{name}'...")
+    # Crée le dossier data/<name> en tant qu'utilisateur
+    mounts = common_mounts(cfg, args.name, ensure_dirs=True)
+
+    cmd = ["docker", "run", "-it", "--name", name, "--hostname", name]
+    cmd += x11_mounts_full(cfg)
+    cmd += x11_auth_mount()
+    cmd += mounts
+    cmd += [cfg.get("docker", {}).get("image", image)]
+    run(cmd)
+
+def cmd_remove(args):
+    cfg = load_config()
+    if not args.name:
+        print("Usage: qualipen rm <nom>", file=sys.stderr)
+        sys.exit(2)
+    name = f"{cfg.get('docker', {}).get('shell_container_prefix', 'pen-shell-')}{args.name}"
+    volume_root = cfg.get("paths", {}).get("volume_root")
+    host_path = os.path.join(volume_root, args.name) if volume_root else None
+
+    # Supprime le conteneur
+    if container_exists(name):
+        print(f"🗑️  Removing container: {name}")
+        run(["docker", "rm", "-f", name])
+    else:
+        print(f"ℹ️  Container '{name}' inexistant.")
+
+    # Propose de supprimer le dossier data
+    if host_path and Path(host_path).exists():
+        if args.yes:
+            choice = "y"
+        else:
+            choice = input(f"Voulez-vous aussi supprimer le dossier local ?\n  {host_path}\n(y/N) ").strip().lower()
+        if choice == "y":
+            subprocess.run(["rm", "-rf", host_path], check=False)
+            print(f"✅ Dossier supprimé : {host_path}")
+        else:
+            print("📦 Dossier conservé.")
+    else:
+        print(f"ℹ️  Pas de dossier trouvé pour : {host_path}")
+
+def ensure_volume(name: str) -> bool:
+    # True si présent
+    r = subprocess.run(["docker", "volume", "inspect", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+def cmd_burp(args):
+    cfg = load_config()
+    if not args.name:
+        print("Usage: qualipen burp <nom>", file=sys.stderr)
+        sys.exit(2)
+    burp_cfg = cfg.get("burp", {})
+    burp_vol = burp_cfg.get("volume", "burp-data")
+
+    # crée le volume s'il n'existe pas
+    subprocess.run(["docker", "volume", "create", "--name", burp_vol], stdout=subprocess.DEVNULL)
+
+    # check exécutable présent
+    if not burp_executable_present(cfg, burp_vol):
+        print("❌ /root/burp/BurpSuitePro introuvable dans le volume 'burp-data'.", file=sys.stderr)
+        print("   Initialise le volume avec tes fichiers (exécutable, etc.) :")
+        print("   - si tu as ~/.qualipen/base_config/burp_installer :  qualipen burp-init")
+        print("   - sinon : qualipen burp-init --from /chemin/vers/ton/burp_installer")
+        sys.exit(1)
+
+    mounts = common_mounts(cfg, args.name, ensure_dirs=True)
+    cmd = ["docker", "run", "-it", "--rm",
+           "--name", "burp-pro"]
+    cmd += x11_mounts_full(cfg)
+    cmd += x11_auth_mount()
+    cmd += ["-v", f"{burp_vol}:/root/burp"]
+    cmd += mounts
+    cmd += [cfg.get("docker", {}).get("image", "tools-team"),
+            burp_cfg.get("executable", "/root/burp/BurpSuitePro")]
+    print("🧪 Launching Burp Suite Pro...")
+    run(cmd)
+
+
+def cmd_zap(args):
+    cfg = load_config()
+    if not args.name:
+        print("Usage: qualipen zap <nom>", file=sys.stderr)
+        sys.exit(2)
+    zap_cfg = cfg.get("zap", {})
+    zap_vol = zap_cfg.get("volume", "zap-data")
+
+    # crée le volume s'il n'existe pas
+    subprocess.run(["docker", "volume", "create", "--name", zap_vol], stdout=subprocess.DEVNULL)
+    mounts = common_mounts(cfg, args.name, ensure_dirs=True)
+
+    cmd = ["docker", "run", "-it", "--rm",
+           "--name", "zap-gui"]
+    cmd += x11_mounts_full(cfg)
+    cmd += ["-v", f"{zap_vol}:/root/.ZAP"]
+    cmd += mounts
+    cmd += [cfg.get("docker", {}).get("image", "tools-team"),
+            zap_cfg.get("executable", "zaproxy")]
+    print("🕷️  Launching OWASP ZAP...")
+    run(cmd)
+
+def cmd_info(args):
+    """
+    Liste les conteneurs Docker.
+    Par défaut : uniquement ceux de QualiPen (prefix + outils).
+    Avec -a/--all : tous les conteneurs Docker.
+    """
+    cfg = load_config()
+    prefix = cfg.get("docker", {}).get("shell_container_prefix", "pen-shell-")
+    image = cfg.get("docker", {}).get("image", "tools-team")
+    volume_root = cfg.get("paths", {}).get("volume_root")
+
+    # Récupère tous les conteneurs (même stoppés), format simple à parser
+    fmt = "{{.Names}}|{{.Image}}|{{.Status}}|{{.RunningFor}}|{{.ID}}"
+    proc = subprocess.run(["docker", "ps", "-a", "--format", fmt],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print("❌ Impossible de lister les conteneurs.", file=sys.stderr)
+        sys.exit(proc.returncode)
+
+    rows = []
+    for line in proc.stdout.splitlines():
+        name, img, status, age, cid = (line.split("|", 4) + ["", "", "", "", ""])[:5]
+
+        if not args.all:
+            # On ne garde que les conteneurs QualiPen :
+            # - ceux avec le préfixe pen-shell-*
+            # - et les outils GUI connus
+            if not (name.startswith(prefix) or name in ("burp-pro", "zap-gui")):
+                continue
+
+        # Colonne data_dir : pour les shells pen-shell-<suffix>, on pointe vers ~/.qualipen/data/<suffix>
+        data_dir = ""
+        if name.startswith(prefix) and volume_root:
+            suffix = name[len(prefix):]
+            candidate = os.path.join(volume_root, suffix)
+            exists = "✓" if os.path.isdir(candidate) else "✗"
+            data_dir = f"{candidate} {exists}"
+
+        rows.append([name, img, status, age, cid[:12], data_dir])
+
+    if not rows:
+        print("Aucun conteneur trouvé." if args.all else "Aucun conteneur QualiPen trouvé.")
+        return
+
+    # Affichage en tableau monospace
+    headers = ["NAME", "IMAGE", "STATUS", "AGE", "ID", "DATA_DIR"]
+    col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    def fmt_row(r): return "  ".join(val.ljust(col_widths[i]) for i, val in enumerate(r))
+
+    print(fmt_row(headers))
+    print("  ".join("-" * w for w in col_widths))
+    for r in rows:
+        print(fmt_row(r))
+
+    print(f"\nTotal: {len(rows)} conteneur(s){' (tous)' if args.all else ' (QualiPen)'}")
+
+
+def make_parser():
+    p = argparse.ArgumentParser(prog="qualipen", description="QualiPen Docker helper (YAML + Python CLI)")
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("init", help="Initialise ~/.qualipen (config + dossiers)")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("build", help="docker build de l'image tools-team")
+    sp.add_argument("--tag", "-t", help="Nom de l'image (def: config.docker.image)")
+    sp.add_argument("--context", help="Contexte de build (def: config.docker.build_context)")
+    sp.add_argument("--no-cache", action="store_true", help="Désactive le cache")
+    sp.add_argument("--pull", action="store_true", help="Toujours récupérer les couches depuis le registry")
+    sp.add_argument("--build-arg", action="append", help="--build-arg KEY=VAL (répétable)")
+    sp.set_defaults(func=cmd_build)
+
+    sp = sub.add_parser("shell", help="Crée/attache un shell interactif (pen-shell-<nom>)")
+    sp.add_argument("name", nargs="?", help="Suffixe du conteneur/dossier (ex: test1)")
+    sp.set_defaults(func=cmd_shell)
+
+    sp = sub.add_parser("rm", help="Supprime le conteneur + propose de supprimer le dossier local")
+    sp.add_argument("name", nargs="?", help="Suffixe du conteneur/dossier")
+    sp.add_argument("-y", "--yes", action="store_true", help="Supprimer le dossier sans demander")
+    sp.set_defaults(func=cmd_remove)
+
+    sp = sub.add_parser("burp-init", help="Prépare le volume Burp et (optionnel) copie l'installation complète")
+    sp.add_argument("--from", dest="src",
+                    help="Dossier qui contient Burp (BurpSuitePro, burpsuite_pro.jar, jre/, .install4j, ...)")
+    sp.set_defaults(func=cmd_burp_init)
+
+    sp = sub.add_parser("burp", help="Lance Burp Suite Pro avec volume persistant burp-data")
+    sp.add_argument("name", nargs="?", help="Nom du dossier local à monter")
+    sp.set_defaults(func=cmd_burp)
+
+    sp = sub.add_parser("zap", help="Lance OWASP ZAP avec volume persistant zap-data")
+    sp.add_argument("name", nargs="?", help="Nom du dossier local à monter")
+    sp.set_defaults(func=cmd_zap)
+
+    sp = sub.add_parser("info", help="Liste les conteneurs (par défaut: QualiPen)")
+    sp.add_argument("-a", "--all", action="store_true",
+                    help="Afficher tous les conteneurs Docker")
+    sp.set_defaults(func=cmd_info)  
+
+    return p
+
+def main():
+    if not docker_exists():
+        print("❌ Docker introuvable. Installe Docker et vérifie que le daemon tourne.", file=sys.stderr)
+        sys.exit(1)
+    parser = make_parser()
+    args = parser.parse_args()
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        sys.exit(0)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()

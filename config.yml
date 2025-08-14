@@ -1,0 +1,28 @@
+# ~/.qualipen/config.yml
+paths:
+  tools_root: "${HOME}/QualiPen"           # (optionnel) ancien dossier racine
+  volume_root: "${HOME}/.qualipen/data"    # dossiers data par conteneur (créés par l'utilisateur)
+  base_config: "${HOME}/.qualipen/base_config"
+  my_config: "${HOME}/.qualipen/my_config"
+  common: "${HOME}/.qualipen/common"       # dossier commun monté partout
+
+docker:
+  image: "tools-team"
+  shell_container_prefix: "pen-shell-"
+  x11_socket: "/tmp/.X11-unix"
+  use_display: true
+  build_context: "../"                     # contexte par défaut du build (modifiable en CLI)
+
+mounts:
+  data: "/root/data"
+  base_config: "/opt/base_config"
+  my_config: "/opt/my_config"
+  common: "/opt/common"
+
+burp:
+  volume: "burp-data"
+  executable: "/root/burp/BurpSuitePro"    # binaire dans l'image tools-team
+
+zap:
+  volume: "zap-data"
+  executable: "zaproxy"                    # entrée de l'image tools-team (GUI)
