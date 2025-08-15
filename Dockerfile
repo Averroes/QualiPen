@@ -11,20 +11,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VENV_PATH=/opt/venv \
     PATH=/root/go/bin:/opt/pipx/bin:/root/.local/bin:/opt/venv/bin:$PATH \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    LANG=fr_FR.UTF-8 \
+    LC_TIME=fr_FR.UTF-8 \
+    TERM=xterm-256color
 WORKDIR /root
 
 # ------- System packages -------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates wget curl git git-lfs zsh tmux vim file \
-    iputils-ping net-tools dnsutils tcpdump traceroute netcat-traditional \
+    iputils-ping net-tools dnsutils tcpdump traceroute netcat-traditional iproute2 \
     ruby ruby-dev build-essential default-jre \
     python3 python3-venv python3-pip pipx \
     golang-go libpcap-dev \
     seclists burpsuite zaproxy nmap masscan whatweb dnsrecon theharvester nikto cewl wapiti sqlmap dirsearch \
     fierce sslscan wpscan recon-ng enum4linux-ng samba-common-bin python3-impacket trufflehog findomain \
-  && rm -rf /var/lib/apt/lists/*
+    command-not-found \
+    && dpkg-reconfigure command-not-found \
+    && apt-get install -y locales \
+    && sed -i 's/# fr_FR.UTF-8 UTF-8/fr_FR.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen fr_FR.UTF-8 \
+    && update-locale LANG=fr_FR.UTF-8 LC_TIME=fr_FR.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Fix shebangs éventuels
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python
@@ -106,7 +114,15 @@ RUN ln -s $WORDLISTS_DIR/Discovery/DNS/subdomains-top1million-110000.txt /root/s
     ln -s $WORDLISTS_DIR/Discovery/Web-Content/directory-list-2.3-medium.txt /root/dirs.txt
 
 # ------- Oh-My-Zsh -------
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+RUN set -eux; \
+    clone() { git clone --depth 1 "$1" "$2"; }; \
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
+    clone https://github.com/rupa/z.git ~/.oh-my-zsh/custom/plugins/z  && \
+    clone https://github.com/zsh-users/zsh-autosuggestions ~/.oh-my-zsh/custom/plugins/zsh-autosuggestions && \
+    clone https://github.com/zsh-users/zsh-syntax-highlighting.git ~/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting && \
+    clone https://github.com/zsh-users/zsh-history-substring-search ~/.oh-my-zsh/custom/plugins/history-substring-search
+
+COPY ./base_config/.zshrc /root/.zshrc
 
 WORKDIR /root/data
 CMD ["zsh"]
